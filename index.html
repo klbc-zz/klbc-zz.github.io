@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="utf-8" />
+    <link rel="icon" href="favicon.ico" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="深圳市常工电子“蓝牙水控器”控制程序的开源实现。适用于国内各大高校宿舍热水器。" />
+    <meta name="theme-color" content="#fafafa" />
+    <link rel="apple-touch-icon" href="logo192.png" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="stylesheet" href="light.min.css"> <!-- https://watercss.kognise.dev/ -->
+    <title>蓝牙水控器 FOSS</title>
+    <style>
+        body {
+            background-color: #fafafa;
+        }
+
+        div {
+            position: absolute;
+            left: 50%;
+            top: 50%;
+            -webkit-transform: translate(-50%, -50%);
+            transform: translate(-50%, -50%);
+            display: flex;
+            align-items: center;
+            flex-direction: column;
+        }
+    </style>
+</head>
+
+<body>
+    <div>
+        <noscript>需要启用 JavaScript。</noscript>
+        <button id="main-button" onclick="handleButtonClick()">开启</button>
+        <p id="device-name" style="margin-top: 10px; margin-bottom: 10px;">未连接</p>
+        <p id="status" style="margin: 0;"></p>
+    </div>
+    <dialog id="dialog">
+        <header>出现错误</header>
+        <form method="dialog">
+            <p id="dialog-content"></p>
+            <menu style="display: flex; justify-content: flex-end;">
+                <button onclick="succeeded = false">好</button>
+            </menu>
+        </form>
+    </dialog>
+</body>
+
+<script>
+    function crc16changgong(data) {
+        let crc = 0x1017;
+        for (let i = 0; i < data.length; i++) {
+            crc ^= data.charCodeAt(i);
+            for (let j = 0; j < 8; j++) {
+                if ((crc & 0x0001) == 1) {
+                    crc >>= 1;
+                    crc ^= 0xA001;
+                } else crc >>= 1;
+            }
+        }
+        return crc;
+    }
+
+    function makePayload(deviceName) {
+        const checksum = crc16changgong(deviceName.slice(-5));
+        // prettier-ignore
+        return new Uint8Array([
+            0xFE, 0xFE, 0x09, 0xB2,
+            0x01, checksum & 0xFF, checksum >> 8, 0x00,
+            0x70, 0xE2, 0xEB, 0x20,
+            0x01, 0x01, 0x00, 0x00,
+            0x00, 0x6C, 0x30, 0x00
+        ]);
+    }
+
+    let bluetoothDevice;
+    let characteristic;
+    let isStarted = false;
+
+    function updateUi(stage) {
+        const mainButton = document.getElementById("main-button");
+        const deviceName = document.getElementById("device-name");
+        const status = document.getElementById("status");
+        switch (stage) {
+            case "pending":
+                mainButton.innerText = "请稍后";
+                mainButton.disabled = true;
+                deviceName.innerText = "已连接：" + bluetoothDevice.name;
+                break;
+            case "ok":
+                mainButton.innerText = "结束";
+                mainButton.disabled = false;
+                break;
+            case "standby":
+                mainButton.innerText = "开启";
+                mainButton.disabled = false;
+                deviceName.innerText = "未连接";
+                break;
+        }
+    }
+
+    async function handleBluetoothError(error) {
+        // this is so fucking ugly but i have no choice
+        // you would never know how those shitty browsers behave
+        if (error.toString().match(/User cancelled/) || error.toString() == "2") return; // "2" is a weird behavior of Bluefy browser on iOS
+        const dialogContent = document.getElementById("dialog-content");
+        if (!navigator.bluetooth || error.toString().match(/Bluetooth adapter not available/)) {
+            dialogContent.innerText = "找不到蓝牙硬件，或浏览器不支持。\n\n限于篇幅，详情请参考源代码仓库内的“疑难解答”。";
+        } else if (error.toString().match(/User denied the browser permission/)) {
+            dialogContent.innerText = "蓝牙权限遭拒。\n\n请前往手机设置，授予浏览器“位置信息”权限。\n此权限不会用于定位，详情请参考源代码仓库内的“疑难解答”。";
+        } else if (error.toString().match(/NetworkError/)) {
+            dialogContent.innerText = "连接不稳定，无法与水控器建立连接。\n请重试。";
+        } else {
+            dialogContent.innerText = error + "\n\n是什么呢\n\n（这可能是一个Bug，请截图并反馈给开发者。）";
+        }
+        document.getElementById("dialog").showModal();
+        if (bluetoothDevice) await bluetoothDevice.gatt.disconnect();
+        isStarted = false;
+        updateUi("standby");
+    }
+
+    async function start() {
+        console.log("进入start方法")
+        try {
+            bluetoothDevice = await navigator.bluetooth.requestDevice({
+                // filters: [{ namePrefix: "2" }],
+                acceptAllDevices: true,//http://localhost:63342/klbc-bluetooth-water-control/manifest.json?_ijt=ji272376ot7avl396u716kucb1
+                optionalServices: ["generic_access"] // actually it's better to use 0xF1F0 instead of "generic_access" but it will trigger a bug on Bluefy
+            });
+            updateUi("pending");
+            const server = await bluetoothDevice.gatt.connect();
+            // 获取蓝牙uuid相关内容
+            const service = await server.getPrimaryService(0xF1F0);
+            console.log(`service`, service);
+            // console.log(`service`, service.uuid);
+            // 获取可以读写字符流的服务
+            characteristic = await service.getCharacteristic(0xF1F1);
+            console.log(`characteristic`, characteristic);
+            // 写入字节(括号中的方法为把字符串转为字符流,传输给蓝牙)
+            await characteristic.writeValue(makePayload(bluetoothDevice.name));
+            isStarted = true;
+            updateUi("ok");
+        } catch (error) {
+            handleBluetoothError(error);
+        }
+    }
+
+    async function end() {
+        try {
+            const endPayload = new Uint8Array([0xFE, 0xFE, 0x09, 0xB3, 0x00, 0x00])
+            await characteristic.writeValue(endPayload)
+            await bluetoothDevice.gatt.disconnect();
+            isStarted = false;
+            updateUi("standby");
+        } catch (error) {
+            handleBluetoothError(error);
+        }
+    }
+
+    function handleButtonClick() {
+        isStarted ? end() : start();
+    }
+
+    const xhr = new XMLHttpRequest();
+    xhr.open("GET", "https://api.countapi.xyz/hit/waterctl/visits");
+    xhr.responseType = "json";
+    xhr.send();
+
+    if (navigator.serviceWorker && !navigator.serviceWorker.controller) {
+        navigator.serviceWorker.register('serviceworker.js');
+    }
+</script>
+
+</html>
